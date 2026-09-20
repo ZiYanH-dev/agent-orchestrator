@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     # redis: 生产用（需 Redis Stack）
     AGENT_CHECKPOINT_BACKEND: str = "memory"
 
+    # ---- Agent 编排模式 ----
+    # deterministic: 四节点固定图，路径由代码预定义
+    # dynamic: supervisor 动态路由，路径由模型在运行时决定
+    AGENT_ORCHESTRATION_MODE: str = "deterministic"
+
+    # ---- 动态编排护栏 ----
+    AGENT_MAX_STEPS: int = 12          # 单次运行允许的最大节点执行次数
+    AGENT_MAX_TOOL_CALLS: int = 3      # 单次运行允许的最大工具调用次数
+    AGENT_HITL_ENABLED: bool = False   # Reviewer 不通过时暂停等人工裁决
+
     # ---- CORS ----
     CORS_ORIGINS: str = "http://127.0.0.1:5872,http://localhost:5872"
 

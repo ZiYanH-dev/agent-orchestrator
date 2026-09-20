@@ -62,7 +62,7 @@ def resume_agent_run_stream(
     return StreamingResponse(
         (
             f"data: {line}\n\n"
-            for line in service.stream_resume(payload.run_id)
+            for line in service.stream_resume(payload.run_id, payload.decision)
         ),
         media_type="text/event-stream",
         headers={
@@ -90,6 +90,7 @@ def start_agent_run(
     return success(data=AgentRunStartResponse(
         run_id=result["run_id"],
         status=result["status"],
+        interrupt=result.get("interrupt"),
     ))
 
 
@@ -99,13 +100,17 @@ def resume_agent_run(
     current_user: UserOut = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ApiResponse[AgentRunStartResponse]:
-    """从 checkpoint 恢复故障的 Agent 运行。"""
+    """从 checkpoint 恢复运行。
+
+    运行状态是 awaiting_review 时，payload.decision 作为人工裁决值继续执行。
+    """
 
     service = MultiAgentService(db)
-    result = service.resume(payload.run_id)
+    result = service.resume(payload.run_id, payload.decision)
     return success(data=AgentRunStartResponse(
         run_id=result["run_id"],
         status=result["status"],
+        interrupt=result.get("interrupt"),
     ))
 
 

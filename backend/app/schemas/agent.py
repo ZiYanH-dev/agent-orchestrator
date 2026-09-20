@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,9 +16,14 @@ class AgentRunRequest(BaseModel):
 
 
 class AgentRunResumeRequest(BaseModel):
-    """恢复运行请求。"""
+    """恢复运行请求，同时用于回答人工介入。
 
-    run_id: str = Field(description="之前故障的 run_id")
+    run_id 指向之前中断的运行；decision 只在运行状态为 awaiting_review 时使用，
+    accept 表示采纳当前草稿，rewrite 表示让 Generator 按反馈重写。
+    """
+
+    run_id: str = Field(description="之前中断或故障的 run_id")
+    decision: str | None = Field(default=None, max_length=32)
 
 
 # ---- 响应 ----
@@ -64,10 +70,14 @@ class AgentRunDetailOut(AgentRunOut):
 
 
 class AgentRunStartResponse(BaseModel):
-    """启动运行的响应（返回 run_id，前端用来轮询/连接 SSE）。"""
+    """启动运行的响应（返回 run_id，前端用来轮询/连接 SSE）。
+
+    status 为 awaiting_review 时 interrupt 非空，前端据此弹出人工裁决入口。
+    """
 
     run_id: str
     status: str
+    interrupt: dict[str, Any] | None = None
 
 
 # ---- SSE 事件类型 ----

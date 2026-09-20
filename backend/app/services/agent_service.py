@@ -17,8 +17,10 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, interrupt
 from sqlalchemy.orm import Session
 from typing_extensions import TypedDict
 
@@ -49,6 +51,12 @@ class AgentState(TypedDict, total=False):
     max_retry: int
     user_id: int
     run_id: str
+    # 动态编排使用：步数用于护栏控制，工具轨迹记录每次工具调用
+    step_count: int
+    tool_trace: list[dict]
+    # 动态编排护栏用：上一次派发目标，以及当时的实质进展指纹
+    last_target: str
+    last_progress_key: str
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +85,22 @@ class MultiAgentService:
     # ------------------------------------------------------------------
 
     def _build_graph(self) -> CompiledStateGraph:
-        """构建 LangGraph 主图。"""
+        """构建 LangGraph 主图。
+
+        编排模式由 settings.AGENT_ORCHESTRATION_MODE 决定：deterministic 走四节点
+        固定图，路径由代码定义；dynamic 走 supervisor 动态路由，路径由模型决定。
+        两种模式共用同一批节点实现，区别只在连线方式。
+        """
         from app.config.checkpoint import get_checkpointer
 
         checkpointer = get_checkpointer()
+
+        if settings.AGENT_ORCHESTRATION_MODE == "dynamic":
+            # 延迟导入，避免与 agent_dynamic 形成循环依赖
+            from app.services.agent_dynamic import build_dynamic_graph
+
+            logger.info("agent orchestration mode: dynamic")
+            return build_dynamic_graph(self, checkpointer)
 
         graph = StateGraph(AgentState)
 
@@ -230,15 +250,24 @@ class MultiAgentService:
 
             sub_tasks = self._normalize_sub_tasks(parsed, state["question"])
 
+            # 动态编排下 Planner 可能被重复派发。重复派发时若照旧清零
+            # current_task_index 与 context_docs，已检索到的片段会白丢，进展指纹
+            # 也会来回抖动，原地打转的检测随之失效。因此只有拆解数量变化、
+            # 也就是真的换了拆法时才重置检索进度。
+            update: AgentState = {"sub_tasks": sub_tasks}
+            replayed = len(sub_tasks) == len(state.get("sub_tasks", []))
+            if not replayed:
+                update["current_task_index"] = 0
+                update["context_docs"] = []
+
             self._record_step_done(
-                step_id, "success", f"sub_tasks={len(sub_tasks)}"
+                step_id,
+                "success",
+                f"sub_tasks={len(sub_tasks)}"
+                + ("（沿用原有检索进度）" if replayed else ""),
             )
 
-            return {
-                "sub_tasks": sub_tasks,
-                "current_task_index": 0,
-                "context_docs": [],
-            }
+            return update
 
         # 记录节点失败后向上抛出，由上层统一落库为 failed
         except Exception as e:
@@ -406,17 +435,37 @@ class MultiAgentService:
                     "final_answer": state["draft_answer"],
                     "review_feedback": "",
                 }
-            else:
-                new_retry = state.get("retry_count", 0) + 1
-                self._record_step_done(
-                    step_id, "success",
-                    f"failed review (retry {new_retry}): {feedback[:100]}"
-                )
-                return {
-                    "final_answer": "",
-                    "review_feedback": feedback,
-                    "retry_count": new_retry,
-                }
+
+            # 开启人工介入时，质检不通过先暂停等人裁决，而不是立刻重写
+            if settings.AGENT_HITL_ENABLED:
+                decision = interrupt({
+                    "type": "review_rejected",
+                    "question": state["question"],
+                    "draft": state["draft_answer"],
+                    "feedback": feedback,
+                    "options": ["accept", "rewrite"],
+                })
+                self._record_step_done(step_id, "success", f"人工裁决: {decision}")
+                if decision == "accept":
+                    return {
+                        "final_answer": state["draft_answer"],
+                        "review_feedback": "",
+                    }
+
+            new_retry = state.get("retry_count", 0) + 1
+            self._record_step_done(
+                step_id, "success",
+                f"failed review (retry {new_retry}): {feedback[:100]}"
+            )
+            return {
+                "final_answer": "",
+                "review_feedback": feedback,
+                "retry_count": new_retry,
+            }
+
+        # interrupt 抛出的 GraphBubbleUp 是暂停信号，不是节点失败，原样交给图引擎
+        except GraphBubbleUp:
+            raise
 
         # 记录节点失败后向上抛出，由上层统一落库为 failed
         except Exception as e:
@@ -440,6 +489,49 @@ class MultiAgentService:
         if state.get("retry_count", 0) >= state.get("max_retry", 3):
             return END
         return "generator"
+
+    # ------------------------------------------------------------------
+    # 人工介入
+    # ------------------------------------------------------------------
+
+    def _pending_interrupts(self, run_id: str) -> list[Any]:
+        """从 checkpoint 读取尚未被消费的 interrupt。
+
+        invoke 的返回状态里带 __interrupt__ 键，流式路径拿不到这个键，
+        因此统一再查一次 checkpoint，两条路径共用同一套判断。
+        """
+        snapshot = self._graph.get_state({"configurable": {"thread_id": run_id}})
+        return [item for task in snapshot.tasks for item in task.interrupts]
+
+    def _handle_pause(
+        self, run_id: str, final_state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """图因人工介入暂停时，落库为等待裁决并返回暂停信息。
+
+        返回 None 表示本轮没有暂停，调用方继续走正常收尾逻辑。
+        """
+        interrupts = (
+            final_state.get("__interrupt__") or self._pending_interrupts(run_id)
+        )
+        if not interrupts:
+            return None
+
+        payload: Any = interrupts[0].value
+        self._run_repo.update_status(
+            run_id,
+            status="awaiting_review",
+            checkpoint_id=run_id,
+        )
+        self._session.commit()
+        logger.info("run paused for human review, run_id=%s", run_id)
+
+        return {
+            "run_id": run_id,
+            "final_answer": "",
+            "status": "awaiting_review",
+            "error_message": None,
+            "interrupt": payload,
+        }
 
     # ------------------------------------------------------------------
     # 对外 API
@@ -473,6 +565,10 @@ class MultiAgentService:
 
         try:
             final_state = self._graph.invoke(initial_state, config)
+
+            paused = self._handle_pause(run_id, final_state)
+            if paused is not None:
+                return paused
 
             answer = final_state.get("final_answer", "")
             if not answer:
@@ -512,8 +608,11 @@ class MultiAgentService:
                 "error_message": str(e),
             }
 
-    def resume(self, run_id: str) -> dict[str, Any]:
-        """从最近 checkpoint 恢复执行。"""
+    def resume(self, run_id: str, decision: str | None = None) -> dict[str, Any]:
+        """从最近 checkpoint 恢复执行。
+
+        传 decision 表示这是在回答人工介入，会作为 interrupt 的恢复值继续执行。
+        """
         run = self._run_repo.get_by_run_id(run_id)
         if not run:
             return {
@@ -529,12 +628,32 @@ class MultiAgentService:
                 "final_answer": run.final_answer or "",
                 "status": "completed",
                 "error_message": None,
+                "interrupt": None,
+            }
+
+        # 停在人工介入点时没给裁决值，再跑一遍只会重复暂停，直接把待裁决内容返回
+        if run.status == "awaiting_review" and not decision:
+            pending = self._pending_interrupts(run_id)
+            return {
+                "run_id": run_id,
+                "final_answer": "",
+                "status": "awaiting_review",
+                "error_message": None,
+                "interrupt": pending[0].value if pending else None,
             }
 
         config: RunnableConfig = {"configurable": {"thread_id": run_id}}
 
         try:
-            final_state = self._graph.invoke(None, config)
+            # 有裁决值就走人工恢复，否则按 checkpoint 继续
+            resume_payload: Command | None = (
+                Command(resume=decision) if decision else None
+            )
+            final_state = self._graph.invoke(resume_payload, config)
+
+            paused = self._handle_pause(run_id, final_state)
+            if paused is not None:
+                return paused
 
             answer = final_state.get("final_answer", "")
             if not answer:
@@ -686,7 +805,23 @@ class MultiAgentService:
                             ensure_ascii=False,
                         )
 
-            # 流结束，生成最终答案事件
+            # 流结束：可能是正常收尾，也可能是质检不通过等待人工裁决
+            paused = self._handle_pause(run_id, cast(dict[str, Any], last_state))
+            if paused is not None:
+                yield _json.dumps(
+                    {
+                        "type": "interrupt",
+                        "run_id": run_id,
+                        "interrupt": paused["interrupt"],
+                    },
+                    ensure_ascii=False,
+                )
+                yield _json.dumps(
+                    {"type": "done", "run_id": run_id},
+                    ensure_ascii=False,
+                )
+                return
+
             answer = last_state.get("final_answer") or last_state.get("draft_answer", "")
 
             self._run_repo.update_status(
@@ -723,8 +858,11 @@ class MultiAgentService:
                 ensure_ascii=False,
             )
 
-    def stream_resume(self, run_id: str) -> Any:
-        """从 checkpoint 恢复并流式继续执行。"""
+    def stream_resume(self, run_id: str, decision: str | None = None) -> Any:
+        """从 checkpoint 恢复并流式继续执行。
+
+        传 decision 表示这是在回答人工介入，会作为 interrupt 的恢复值继续执行。
+        """
         import json as _json
 
         run = self._run_repo.get_by_run_id(run_id)
@@ -759,9 +897,13 @@ class MultiAgentService:
         )
 
         last_state: AgentState | None = None
+        # 有裁决值就走人工恢复，否则按 checkpoint 继续
+        resume_payload: Command | None = (
+            Command(resume=decision) if decision else None
+        )
         try:
             for mode, payload in self._graph.stream(
-                None, config, stream_mode=["updates", "values"]
+                resume_payload, config, stream_mode=["updates", "values"]
             ):
                 if mode == "values":
                     last_state = cast(AgentState, payload)
@@ -790,6 +932,23 @@ class MultiAgentService:
                         },
                         ensure_ascii=False,
                     )
+
+            # 流结束：可能是正常收尾，也可能再次停在人工介入点
+            paused = self._handle_pause(run_id, cast(dict[str, Any], last_state or {}))
+            if paused is not None:
+                yield _json.dumps(
+                    {
+                        "type": "interrupt",
+                        "run_id": run_id,
+                        "interrupt": paused["interrupt"],
+                    },
+                    ensure_ascii=False,
+                )
+                yield _json.dumps(
+                    {"type": "done", "run_id": run_id},
+                    ensure_ascii=False,
+                )
+                return
 
             answer = (last_state or {}).get("final_answer") or (last_state or {}).get(
                 "draft_answer", ""
