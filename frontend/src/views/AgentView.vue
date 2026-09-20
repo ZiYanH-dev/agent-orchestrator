@@ -5,6 +5,7 @@ import { useAgentStore } from "@/stores/agent";
 
 const agentStore = useAgentStore();
 const input = ref("");
+const decisionLoading = ref(false);
 
 const nodeLabels: Record<string, string> = {
   planner: "🧠 Planner",
@@ -19,6 +20,7 @@ const statusColors: Record<string, string> = {
   retrieving: "#409eff",
   generating: "#e6a23c",
   reviewing: "#e6a23c",
+  awaiting_review: "#e6a23c",
   completed: "#67c23a",
   failed: "#f56c6c",
 };
@@ -35,6 +37,17 @@ async function handleRun() {
 async function handleResume() {
   if (!agentStore.currentRunId) return;
   await agentStore.resume(agentStore.currentRunId);
+}
+
+/** 回答人工介入：采纳草稿或让 Generator 按反馈重写。 */
+async function handleDecision(decision: "accept" | "rewrite") {
+  if (!agentStore.currentRunId || decisionLoading.value) return;
+  decisionLoading.value = true;
+  try {
+    await agentStore.decide(decision);
+  } finally {
+    decisionLoading.value = false;
+  }
 }
 
 onMounted(() => {
@@ -134,6 +147,32 @@ onMounted(() => {
         <div class="answer-label">⏳ 等待最终答案...</div>
       </div>
 
+      <!-- 人工介入：质检未通过，等人工裁决 -->
+      <div v-if="agentStore.pendingInterrupt" class="hitl-box">
+        <div class="hitl-label">🖐️ 质检未通过，等待人工裁决</div>
+        <div class="hitl-feedback">
+          📝 {{ agentStore.pendingInterrupt.feedback || "Reviewer 未给出改进建议" }}
+        </div>
+        <div class="hitl-draft">{{ agentStore.pendingInterrupt.draft }}</div>
+        <div class="hitl-actions">
+          <el-button
+            type="primary"
+            size="small"
+            :loading="decisionLoading"
+            @click="handleDecision('accept')"
+          >
+            采纳草稿
+          </el-button>
+          <el-button
+            size="small"
+            :disabled="decisionLoading"
+            @click="handleDecision('rewrite')"
+          >
+            让 Generator 重写
+          </el-button>
+        </div>
+      </div>
+
       <!-- 错误信息 -->
       <div v-if="agentStore.error" class="error-box">
         ❌ {{ agentStore.error }}
@@ -168,6 +207,44 @@ onMounted(() => {
   border-radius: 8px;
   padding: 20px;
   margin-bottom: 20px;
+}
+
+.hitl-box {
+  margin-top: 16px;
+  padding: 16px;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 8px;
+}
+
+.hitl-label {
+  font-weight: 600;
+  color: #b88230;
+  margin-bottom: 8px;
+}
+
+.hitl-feedback {
+  font-size: 13px;
+  color: #8a6d3b;
+  margin-bottom: 10px;
+}
+
+.hitl-draft {
+  white-space: pre-wrap;
+  background: #fff;
+  border-radius: 6px;
+  padding: 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #303133;
+}
+
+.hitl-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
 }
 
 .input-area h3 {

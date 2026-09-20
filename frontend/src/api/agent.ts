@@ -1,8 +1,18 @@
 import api from "./index";
 
+/** 人工介入的待裁决内容，由 Reviewer 质检不通过时产生。 */
+export interface AgentInterrupt {
+  type: string;
+  question: string;
+  draft: string;
+  feedback: string;
+  options: string[];
+}
+
 export interface AgentRunStartData {
   run_id: string;
   status: string;
+  interrupt?: AgentInterrupt | null;
 }
 
 export interface AgentRunStep {
@@ -51,9 +61,10 @@ export function startAgentRun(
 }
 
 export function resumeAgentRun(
-  runId: string
+  runId: string,
+  decision?: string
 ): Promise<{ data: AgentRunStartData }> {
-  return api.post("/agent/runs/resume", { run_id: runId });
+  return api.post("/agent/runs/resume", { run_id: runId, decision });
 }
 
 export function fetchRunDetail(
@@ -81,6 +92,8 @@ export interface SSEEvent {
   answer?: string;
   message?: string;
   retry_count?: number;
+  /** type 为 interrupt 时携带待裁决内容。 */
+  interrupt?: AgentInterrupt;
 }
 
 const TOKEN_KEY = "rag_token";
@@ -127,9 +140,15 @@ export async function streamAgentRun(params: {
   params.onDone?.();
 }
 
-/** SSE resume 端点。 */
+/**
+ * SSE resume 端点。
+ *
+ * 传 decision 表示这是在回答人工介入：accept 采纳当前草稿，rewrite 让
+ * Generator 按 Reviewer 的反馈重写。不传则按 checkpoint 继续执行。
+ */
 export async function streamAgentResume(params: {
   runId: string;
+  decision?: string;
   onEvent: (evt: SSEEvent) => void;
   onDone?: () => void;
   onError?: (err: Error) => void;
@@ -142,7 +161,7 @@ export async function streamAgentResume(params: {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ run_id: params.runId }),
+    body: JSON.stringify({ run_id: params.runId, decision: params.decision }),
     signal: params.signal,
   });
 

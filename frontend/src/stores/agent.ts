@@ -6,6 +6,7 @@ import {
   listAgentRuns,
   streamAgentResume,
   streamAgentRun,
+  type AgentInterrupt,
   type SSEEvent,
 } from "@/api/agent";
 
@@ -29,6 +30,8 @@ export const useAgentStore = defineStore("agent", () => {
   const steps = ref<StepState[]>([]);
   const loading = ref(false);
   const done = ref(false);
+  // 质检不通过时的待裁决内容，非空表示运行停在人工介入点
+  const pendingInterrupt = ref<AgentInterrupt | null>(null);
   const error = ref<string | null>(null);
   const runs = ref<
     Array<{
@@ -49,6 +52,7 @@ export const useAgentStore = defineStore("agent", () => {
     done.value = false;
     error.value = null;
     currentRun.value = null;
+    pendingInterrupt.value = null;
     steps.value = [];
 
     try {
@@ -82,6 +86,37 @@ export const useAgentStore = defineStore("agent", () => {
     try {
       await streamAgentResume({
         runId,
+        signal: abortCtrl.signal,
+        onEvent: handleEvent,
+        onDone: () => {
+          loading.value = false;
+          done.value = true;
+        },
+        onError: (err) => {
+          error.value = err.message;
+          loading.value = false;
+        },
+      });
+    } catch (e) {
+      error.value = (e as Error).message;
+      loading.value = false;
+    }
+  }
+
+  /** 回答人工介入：accept 采纳当前草稿，rewrite 让 Generator 按反馈重写。 */
+  async function decide(decision: "accept" | "rewrite") {
+    if (!currentRunId.value) return;
+    abortCtrl?.abort();
+    abortCtrl = new AbortController();
+    loading.value = true;
+    done.value = false;
+    error.value = null;
+    pendingInterrupt.value = null;
+
+    try {
+      await streamAgentResume({
+        runId: currentRunId.value,
+        decision,
         signal: abortCtrl.signal,
         onEvent: handleEvent,
         onDone: () => {
@@ -154,6 +189,24 @@ export const useAgentStore = defineStore("agent", () => {
         break;
       }
 
+      case "interrupt": {
+        pendingInterrupt.value = evt.interrupt ?? null;
+        if (currentRun.value) {
+          currentRun.value.status = "awaiting_review";
+        } else if (currentRunId.value) {
+          currentRun.value = {
+            run_id: currentRunId.value,
+            status: "awaiting_review",
+            question: "",
+            final_answer: "",
+            retry_count: 0,
+          };
+        }
+        loading.value = false;
+        done.value = true;
+        break;
+      }
+
       case "error": {
         error.value = evt.message ?? "未知错误";
         if (currentRun.value) {
@@ -223,6 +276,7 @@ export const useAgentStore = defineStore("agent", () => {
     steps.value = [];
     error.value = null;
     done.value = false;
+    pendingInterrupt.value = null;
   }
 
   return {
@@ -232,9 +286,11 @@ export const useAgentStore = defineStore("agent", () => {
     loading,
     done,
     error,
+    pendingInterrupt,
     runs,
     run,
     resume,
+    decide,
     refreshDetail,
     loadRuns,
     clearCurrent,
