@@ -1,0 +1,101 @@
+[project]
+name = "rag-demo-backend"
+version = "0.1.0"
+description = "RAG Demo FastAPI backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.30",
+    "psycopg[binary]>=3.2.0",
+    "pgvector>=0.3.0",
+    "redis>=5.0.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "python-dotenv>=1.0.1",
+    "python-multipart>=0.0.9",
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-community>=0.3.0",
+    "langchain-text-splitters>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langgraph>=0.2.0",
+    "pyjwt>=2.8.0",
+    "bcrypt>=4.1.0",
+    "alembic>=1.13.0",
+    "langgraph-checkpoint-redis>=0.5.2",
+]
+
+[tool.uv]
+package = false
+
+# 使用国内镜像加速依赖下载
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.10.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "F",     # Pyflakes
+    "I",     # isort (import order)
+    "B",     # flake8-bugbear
+    "BLE",   # flake8-blind-except
+    "UP",    # pyupgrade
+    "RUF",   # ruff-specific
+]
+ignore = [
+    "B008",  # do not perform function calls in argument defaults (FastAPI Depends 常冲突)
+    "E501",  # line too long (交给 format 管)
+    "F821",  # undefined name (SQLAlchemy forward-ref 字符串 与 Pydantic 条件导入常冲突)
+    "RUF001", # ambiguous unicode in string (中文注释常用全角引号/破折号)
+    "RUF002", # ambiguous unicode in docstring
+    "RUF003", # ambiguous unicode in comment
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+required-imports = ["from __future__ import annotations"]
+force-single-line = false
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+# SQLAlchemy 关系用字符串前向引用声明目标类，mypy 静态无法解析，
+# 与 ruff 忽略 F821 是同一个原因。
+[[tool.mypy.overrides]]
+module = ["app.models.*"]
+disable_error_code = ["name-defined"]
+
+# LangChain 用 pydantic validation_alias 暴露 base_url / api_key，
+# 这两个名字不在 __init__ 的显式签名里，运行时可正常传入。
+[[tool.mypy.overrides]]
+module = ["app.config.embeddings_client"]
+disable_error_code = ["call-arg"]

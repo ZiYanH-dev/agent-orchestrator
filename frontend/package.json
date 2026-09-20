@@ -1,0 +1,28 @@
+{
+  "name": "rag-demo-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "type-check": "vue-tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "axios": "^1.7.0",
+    "element-plus": "^2.14.5",
+    "pinia": "^4.0.3",
+    "vue": "^3.4.0",
+    "vue-router": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "@vue/tsconfig": "^0.9.1",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.0",
+    "vue-tsc": "^3.3.11"
+  }
+}

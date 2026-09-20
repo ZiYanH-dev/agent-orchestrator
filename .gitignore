@@ -1,0 +1,42 @@
+# Python (uv)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node (pnpm)
+node_modules/
+dist/
+.vite/
+.pnpm-store/
+
+# 环境变量
+.env
+# .env.example 应随模板提交，勿忽略
+!.env.example
+
+# 数据（运行时上传的文档，不入库）
+data/*
+!data/demo.txt
+backend/data/
+chroma_db/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 本地日志 (make start 后台服务输出)
+.logs/
+
+# 系统
+.DS_Store
+# 本地项目帮助软链(个人环境,不含在模板中)
+.project_help
