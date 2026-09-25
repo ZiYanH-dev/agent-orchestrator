@@ -1,15 +1,15 @@
 # Agent Orchestrator
 
-基于 **LangGraph** 的多 Agent 编排引擎。四个角色分工完成「问题拆解 → 文档检索 → 答案生成 → 质量质检」的闭环，编排本身才是这套系统的本体，检索只是被编排的一个环节。
+基于 **LangGraph** 的多 Agent 编排引擎。四个核心角色分工完成「问题拆解 → 文档检索 → 答案生成 → 质量质检」的闭环，编排本身才是这套系统的本体，检索只是被编排的一个环节。
 
 支持两种编排模式，由配置切换，复用同一批节点实现：
 
-| 模式 | 路径怎么定 | 适用 |
+| 模式 | 路径定义方式 | 适用场景 |
 | --- | --- | --- |
 | `deterministic` | 边由代码写死，`Planner → Retriever → Generator ⇄ Reviewer` | 流程稳定的问答 |
 | `dynamic` | 中间插入 `supervisor`，每一步由模型读取阶段状态决定下一个执行者 | 路径随任务形状变化 |
 
-动态模式下模型决策不受约束，因此叠加六层护栏：步数上限、目标白名单、前置状态校验、原地打转检测、工具调用上限、重试上限。任一层触发都退回与确定性编排同构的规则路径，保证图一定收敛。
+动态模式下模型决策不受约束，因此叠加六层护栏，任一层触发都退回与确定性编排同构的规则路径，保证图一定收敛。
 
 ## 目录
 
@@ -34,12 +34,14 @@
 
 ## 技术栈
 
-| 端 | 技术 | 包管理 |
-| --- | --- | --- |
-| 后端 | FastAPI · SQLAlchemy · Pydantic · LangChain · LangGraph · JWT · bcrypt | uv |
-| 前端 | Vue 3 · Vite · Pinia · Vue Router · Element Plus · Axios | pnpm |
-| 中间件 | PostgreSQL + pgvector · Redis | Docker |
-| AI | OpenAI 兼容协议（Ollama / 阿里云百炼 / OpenAI / DeepSeek） | — |
+| 模块 | 技术栈 |
+| --- | --- |
+| 前端 | Vue 3 · TypeScript · Vite · Pinia · Vue Router · Element Plus · Axios |
+| 后端 | Python 3.11 · FastAPI · SQLAlchemy · Pydantic |
+| Agent 编排 | LangGraph · LangChain |
+| 存储 | PostgreSQL 17 + pgvector（向量库）· Redis（检索缓存 / Agent Checkpoint） |
+| 鉴权 | JWT · bcrypt |
+| AI 服务 | OpenAI 兼容协议（Ollama / 阿里云百炼 / OpenAI / DeepSeek） |
 
 > 统一 OpenAI 兼容协议：切换 LLM / Embedding 提供方只需改 `.env` 里的 `LLM_BASE_URL` / `EMBED_BASE_URL` 与模型名，无需改代码。
 
@@ -49,10 +51,19 @@
 
 | 工具 | 用途 |
 | --- | --- |
-| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | PostgreSQL + Redis |
-| [uv](https://docs.astral.sh/uv/) | Python 包管理 |
-| [pnpm](https://pnpm.io/) | 前端包管理 |
-| [Ollama](https://ollama.com/) | 本地 Embedding 模型（用云端则不用装） |
+| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | 容器运行时，承载下面两个中间件镜像 |
+| [uv](https://docs.astral.sh/uv/) | 后端 Python 依赖管理（`pyproject.toml` + `uv.lock`） |
+| [pnpm](https://pnpm.io/) | 前端依赖管理（`package.json` + `pnpm-lock.yaml`） |
+| [Ollama](https://ollama.com/) | 本地 Embedding 模型（Embedding 走云端接口则无需安装） |
+
+中间件镜像由 `docker compose` 自动拉取，无需手动 `docker pull`：
+
+| 镜像 | 标签 | 用途 |
+| --- | --- | --- |
+| `pgvector/pgvector` | `pg17` | PostgreSQL 17 + pgvector 向量扩展，承载文档向量与业务数据 |
+| `redis` | `6-alpine` | 检索结果缓存；`AGENT_CHECKPOINT_BACKEND=redis` 时的 Agent Checkpoint |
+
+> ⚠️ 生产环境请勿使用 `redis:6-alpine` 承载 Checkpoint：`RedisSaver` 依赖 RedisJSON / RediSearch，需替换为 `redis/redis-stack-server`。
 
 ### 配置环境变量
 
@@ -74,7 +85,7 @@ ollama pull nomic-embed-text
 make start
 ```
 
-自动完成：检查并启动 Ollama（仅当 `EMBED_BASE_URL` 指向 Ollama）→ 启动 Docker → `docker compose up -d` → 等待 PostgreSQL 就绪 → `alembic upgrade head` 迁移 → 安装前后端依赖 → 后台拉起前后端。启动后访问：
+自动完成：检查 Ollama（仅当 `EMBED_BASE_URL` 指向本地，缺模型只提示不下载）→ 检查并启动 Docker Desktop → `docker compose up -d` 起中间件 → 轮询等待 PostgreSQL 就绪 → 安装后端依赖并执行 `alembic upgrade head` → 后台拉起前后端开发服务器。首跑前前端依赖需自行安装 `make frontend-deps`。启动后访问：
 
 | 服务 | 地址 |
 | --- | --- |
@@ -95,27 +106,51 @@ make start
 
 > ⚠️ 旧数据需重建库时：`make infra-reset` 清空数据卷，再 `make db-upgrade` 重新迁移。
 
+### 生产部署
+
+生产使用独立的 compose（`docker-compose.prod.yml`）：构建前后端镜像，由前端 nginx 统一对外，后端容器启动时先自动执行 `alembic upgrade head` 再拉起 uvicorn。
+
+```bash
+make prod-up                      # 构建并后台启动，默认对外 80 端口
+make prod-up PROD_PORT=8080       # 自定义对外端口
+```
+
+| 命令 | 说明 |
+| --- | --- |
+| `make prod-up` | 构建镜像并后台启动生产全栈 |
+| `make prod-down` / `make prod-ps` / `make prod-logs` | 停止（保留数据卷） / 查看状态 / 查看日志 |
+| `make prod-reset` | ⚠️ 停止并清空生产数据卷 |
+
+- 只有前端（nginx）对外暴露端口；后端与数据库仅在 compose 内网，通过服务名 `backend` / `postgres` / `redis` 互访。
+- `LLM_API_KEY` 与 `JWT_SECRET_KEY` 缺失时 compose 直接报错退出（`:?` 强校验）。
+- ⚠️ 容器内的 `EMBED_BASE_URL` 不能指向 `127.0.0.1`（那是容器自身）；本地 Ollama 需改为宿主机可达地址，或改用云端端点。
+
 ## 项目结构
 
 ```
-├── backend/            # FastAPI 后端（五层架构）
-│   └── app/
-│       ├── api/routes/     # 路由层 (chat / agent / auth / documents)
-│       ├── services/       # 服务层 (agent_service 编排主图 / agent_dynamic 动态编排 / rag_service / chat_service)
-│       ├── repositories/   # 仓储层 (数据访问)
-│       ├── schemas/        # 传输模型 (pydantic)
-│       ├── models/         # ORM 模型 (含 agent_run / agent_step)
-│       ├── config/         # 配置 + 客户端单例 (settings/embeddings/llm/redis/db/checkpoint)
-│       ├── core/           # 横切 (exceptions/logging/middleware/response)
-│       ├── utils/          # 纯工具函数
-│       └── main.py
-├── frontend/           # Vue3 前端
-│   └── src/{api,views,components,router,stores}
-│       └── views/AgentView.vue   # 多 Agent 协作可视化 + 人工裁决面板
-├── backend/alembic/    # 数据库迁移 (0001 → 0003)
-├── docker-compose.yml  # PostgreSQL + pgvector / Redis
-├── Makefile            # 一键启动入口 (make start)
-└── .env.example        # 环境变量模板（复制为根目录 .env）
+├── backend/                # FastAPI 后端（五层架构）
+│   ├── app/
+│   │   ├── api/routes/     # 路由层 (chat / agent / auth / documents)
+│   │   ├── services/       # 服务层 (agent_service 编排主图 / agent_dynamic 动态编排 / rag_service / chat_service)
+│   │   ├── repositories/   # 仓储层（数据访问）
+│   │   ├── schemas/        # 传输模型 (Pydantic)
+│   │   ├── models/         # ORM 模型（含 agent_run / agent_step）
+│   │   ├── config/         # 配置与客户端单例 (settings / embeddings / llm / redis / db / checkpoint)
+│   │   ├── core/           # 横切 (exceptions / logging / middleware / response)
+│   │   ├── utils/          # 纯工具函数
+│   │   └── main.py
+│   ├── alembic/            # 数据库迁移 (0001 → 0003)
+│   └── Dockerfile          # 后端生产镜像（多阶段构建 + 启动自动迁移）
+├── frontend/               # Vue 3 前端
+│   ├── src/
+│   │   ├── {api,components,router,stores,views}
+│   │   └── views/AgentView.vue   # 多 Agent 协作可视化 + 人工裁决面板
+│   ├── Dockerfile          # 前端生产镜像（node 构建 → nginx 托管）
+│   └── nginx.conf          # 静态托管 + /api 反向代理 + SSE 透传
+├── docker-compose.yml      # 开发：仅中间件（PostgreSQL + pgvector / Redis）
+├── docker-compose.prod.yml # 生产：全栈（数据库 / 缓存 / 后端 / 前端 nginx）
+├── Makefile                # 一键入口 (make start 开发 / make prod-up 生产)
+└── .env.example            # 环境变量模板（复制为根目录 .env）
 ```
 
 **后端单向调用**：`api → service → repository → model`（禁止反向）。
