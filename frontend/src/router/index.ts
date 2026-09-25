@@ -4,6 +4,7 @@ import AgentView from "@/views/AgentView.vue";
 import ChatView from "@/views/ChatView.vue";
 import DocumentView from "@/views/DocumentView.vue";
 import LoginView from "@/views/LoginView.vue";
+import NotFoundView from "@/views/NotFoundView.vue";
 import ProfileView from "@/views/ProfileView.vue";
 
 const TOKEN_KEY = "rag_token";
@@ -34,6 +35,12 @@ const routes = [
     name: "Profile",
     component: ProfileView,
     meta: { requiresAuth: true },
+  },
+  // 404 兜底必须放在最后：vue-router 按数组顺序匹配，通配路由提前会吃掉后面所有路径
+  {
+    path: "/:pathMatch(.*)*",
+    name: "NotFound",
+    component: NotFoundView,
   },
 ];
 

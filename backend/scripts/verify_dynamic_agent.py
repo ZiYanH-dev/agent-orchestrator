@@ -6,7 +6,8 @@
 
 脚本直接调用服务层，不经过 HTTP，覆盖五组能力：
   1. 动态路由：每一步去向由 supervisor 决定，step 日志里能看到它的决策与理由；
-  2. 五层护栏：非法目标、原地打转、工具调用上限、步数上限都退回规则路径，图仍收敛；
+  2. 六层护栏：非法目标、前置状态未就绪、原地打转、工具调用上限、步数上限都
+     退回规则路径，图仍收敛；
   3. 工具生态：supervisor 派发到 tool 后工具真实执行，结果记进工具轨迹；
   4. 求值安全：算术表达式走 AST 白名单求值，注入型表达式一律拒绝；
   5. 人工介入：质检不通过暂停为 awaiting_review，带裁决值 resume 能跑完。
@@ -42,6 +43,10 @@ ILLEGAL_TARGET_JSON = '{"next": "delete_all_data", "reason": "越权目标"}'
 TOOL_TARGET_JSON = '{"next": "tool", "reason": "先算个数"}'
 CALC_JSON = '{"tool": "calculate", "arguments": {"expression": "120*0.85"}}'
 NO_TOOL_JSON = '{"tool": null, "arguments": {}, "reason": "无需工具"}'
+# 跳过前置节点直接点名下游工人，用来验证前置状态校验这道护栏
+SKIP_TO_GENERATOR_JSON = '{"next": "generator", "reason": "跳过检索直接生成"}'
+SKIP_TO_REVIEWER_JSON = '{"next": "reviewer", "reason": "跳过生成直接审核"}'
+SKIP_TO_RETRIEVER_JSON = '{"next": "retriever", "reason": "跳过拆解直接检索"}'
 
 QUESTION = "这份问卷的主题是什么，包含哪些题目类型？"
 WORKERS = {"planner", "retriever", "generator", "reviewer"}
@@ -249,9 +254,50 @@ def check_guardrail_no_progress(service: MultiAgentService, user_id: int) -> Non
     )
 
 
+def check_guardrail_missing_prerequisite(
+    service: MultiAgentService, user_id: int
+) -> None:
+    """模型跳过前置节点直接点名下游工人时，应回退规则路由而不是让节点崩掉。
+
+    每个工人节点都假设前置节点已经把共享状态写好了：retriever 读 sub_tasks 与
+    current_task_index，generator 与 reviewer 读 context_docs，reviewer 还要读
+    draft_answer。模型不受约束，可以直接点名下游节点；此时节点若照旧用下标读
+    状态就会抛 KeyError，整轮运行以 failed 收尾。这道护栏把「前置状态是否就绪」
+    一并纳入校验，不满足时退回规则路径。
+    """
+    print("\n[5] 护栏 D：前置状态校验")
+
+    cases: list[tuple[str, str]] = [
+        ("跳过拆解直接派 retriever", SKIP_TO_RETRIEVER_JSON),
+        ("跳过检索直接派 generator", SKIP_TO_GENERATOR_JSON),
+        ("跳过生成直接派 reviewer", SKIP_TO_REVIEWER_JSON),
+    ]
+
+    for label, payload in cases:
+        stub = _llm_factory({SUPERVISOR_MARKER: payload, TOOL_MARKER: NO_TOOL_JSON})
+        with patch.object(agent_dynamic, "get_llm", stub):
+            result = _run(service, user_id)
+
+        steps = _steps_of(service, result["run_id"])
+        blocked = [s for s in _supervisor_summaries(steps) if "前置状态未就绪" in s]
+        failed = [s for s in steps if s.status == "failed"]
+
+        _record(
+            f"{label}：回退规则路由",
+            bool(blocked),
+            f"命中 {len(blocked)} 次回退",
+        )
+        _record(
+            f"{label}：无节点崩溃且流程收敛",
+            result["status"] == "completed" and not failed,
+            f"status={result['status']}，failed step={len(failed)}，"
+            f"error={result.get('error_message')}",
+        )
+
+
 def check_tool_ecosystem(service: MultiAgentService, user_id: int) -> None:
     """supervisor 派发到 tool 时工具真实执行，次数封顶后回退规则路由。"""
-    print("\n[5] 工具生态：派发 → 执行 → 次数封顶")
+    print("\n[6] 工具生态：派发 → 执行 → 次数封顶")
     stub = _llm_factory(
         {
             SUPERVISOR_MARKER: TOOL_TARGET_JSON,
@@ -291,7 +337,7 @@ def check_tool_ecosystem(service: MultiAgentService, user_id: int) -> None:
 
 def check_guardrail_max_steps(service: MultiAgentService, user_id: int) -> None:
     """步数上限触发时应直接收尾，不进入死循环。"""
-    print("\n[6] 护栏 C：步数上限")
+    print("\n[7] 护栏 C：步数上限")
     cap = 3
     original = settings.AGENT_MAX_STEPS
     settings.AGENT_MAX_STEPS = cap
@@ -326,7 +372,7 @@ def check_guardrail_max_steps(service: MultiAgentService, user_id: int) -> None:
 
 def check_human_in_the_loop(service: MultiAgentService, user_id: int) -> None:
     """质检不通过且开了 HITL 时应暂停，带裁决值后可继续跑完。"""
-    print("\n[7] 人工介入：暂停 → 裁决 → 继续")
+    print("\n[8] 人工介入：暂停 → 裁决 → 继续")
     settings.AGENT_HITL_ENABLED = True
     stub = _llm_factory({REVIEWER_MARKER: REJECT_JSON})
     try:
@@ -413,6 +459,7 @@ def main() -> int:
         check_dynamic_routing(service, user_id)
         check_guardrail_illegal_target(service, user_id)
         check_guardrail_no_progress(service, user_id)
+        check_guardrail_missing_prerequisite(service, user_id)
         check_tool_ecosystem(service, user_id)
         check_guardrail_max_steps(service, user_id)
         check_human_in_the_loop(service, user_id)

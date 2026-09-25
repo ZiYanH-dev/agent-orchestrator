@@ -14,7 +14,9 @@ DOCKER_COMPOSE:= docker compose
 EMBED_MODEL   ?= nomic-embed-text
 BACKEND_PORT  ?= 8765
 FRONTEND_PORT ?= 5872
+PROD_PORT     ?= 80
 LOG_DIR       := .logs
+ROOT_ENV      := .env
 PG_HOST       ?= 127.0.0.1
 PG_PORT       ?= 5432
 PG_USER       ?= postgres
@@ -26,8 +28,66 @@ PG_USER       ?= postgres
 .PHONY: help
 help:                                 ## 显示此帮助
 	@grep -E '^[a-zA-Z_-]+:.*## .*$$' $(MAKEFILE_LIST) \
-		| sort \
-		| awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
+	@echo "🤖 Agent Orchestrator · 命令列表"
+	@echo "================================"
+	@echo ""
+	@echo "⭐ 一键入口:"
+	@echo "  make start            一键启动: Ollama → Docker → DB → 迁移 → 后端 → 前端"
+	@echo "  make dev              同 start（别名）"
+	@echo "  make up               同 start（别名）"
+	@echo "  make setup            首次 setup（同 start）"
+	@echo "  make all              完整流程"
+	@echo "  make backend-run      后台启动后端 (日志: $(LOG_DIR)/backend.log)"
+	@echo "  make frontend-run     后台启动前端 (日志: $(LOG_DIR)/frontend.log)"
+	@echo "  make stop             停止前后端开发服务器"
+	@echo "  make logs             实时查看前后端日志 (Ctrl+C 退出)"
+	@echo ""
+	@echo "🐳 Docker / 中间件:"
+	@echo "  make docker-check     检查 Docker Desktop，未运行则自动启动"
+	@echo "  make infra            启动中间件: PostgreSQL + Redis"
+	@echo "  make infra-up         启动 Docker 服务（后台）"
+	@echo "  make infra-down       停止 Docker 服务"
+	@echo "  make infra-reset      ⚠️ 重置 Docker 数据卷（清空所有数据）"
+	@echo "  make infra-ps         查看 Docker 容器状态"
+	@echo "  make infra-logs       查看 Docker 容器日志"
+	@echo "  make pg-wait          轮询等待 PostgreSQL 就绪（最多 30s）"
+	@echo ""
+	@echo "🚀 生产部署:"
+	@echo "  make prod-up          构建并后台启动生产全栈 (make prod-up PROD_PORT=8080)"
+	@echo "  make prod-down        停止生产全栈（保留数据卷）"
+	@echo "  make prod-logs        查看生产各服务日志"
+	@echo "  make prod-ps          查看生产各服务状态"
+	@echo "  make prod-reset       ⚠️ 停止生产并清空生产数据卷"
+	@echo ""
+	@echo "🗄️  数据库:"
+	@echo "  make db-generate      生成新迁移 (make db-generate m=\"描述\")"
+	@echo "  make db-upgrade       执行迁移到最新版本（首次 setup 也用它建表）"
+	@echo "  make db-downgrade     回滚一个版本 (或 make db-downgrade v=base 回滚全部)"
+	@echo "  make db-history       查看迁移历史链"
+	@echo "  make db-current       查看当前数据库的迁移版本"
+	@echo "  make db-reset         ⚠️ 清空数据卷后重建 + 重新迁移到 head"
+	@echo ""
+	@echo "🦙 Ollama:"
+	@echo "  make ollama-up        按需检查 Ollama（本地指向时；缺模型只提示、不自动下载）"
+	@echo "  make ollama-list      查看本地 Ollama 模型列表"
+	@echo ""
+	@echo "💻 后端:"
+	@echo "  make backend-env      检查根目录 .env（后端与 compose 共用）"
+	@echo "  make backend-deps     安装后端依赖 (uv sync)"
+	@echo "  make backend          前台启动后端开发服务器 (hot-reload)"
+	@echo "  make backend-lint     后端代码检查 (ruff lint)"
+	@echo "  make backend-format   后端格式化 (ruff format)"
+	@echo "  make backend-typecheck 后端类型检查 (mypy)"
+	@echo "  make backend-test     后端单元测试 (pytest)"
+	@echo "  make check            提交前自检: ruff + mypy + pytest"
+	@echo ""
+	@echo "🎨 前端:"
+	@echo "  make frontend-deps    安装前端依赖 (pnpm install)"
+	@echo "  make frontend         前台启动前端开发服务器 (hot-reload)"
+	@echo "  make frontend-build   前端构建生产包"
+	@echo ""
+	@echo "🧹 工具:"
+	@echo "  make clean            清理: 停止 Docker + 删除 node_modules/uv.lock"
 
 # =============================================================================
 #  一键入口
@@ -38,8 +98,8 @@ start: ollama-up docker-check infra-up pg-wait db-upgrade backend-run frontend-r
 	@echo ""
 	@echo "✅ 项目已全部启动，访问入口："
 	@echo "   🎨 前端页面:  http://localhost:$(FRONTEND_PORT)"
-	@echo "   � 后端接口:  http://127.0.0.1:$(BACKEND_PORT)   API 文档: http://127.0.0.1:$(BACKEND_PORT)/docs"
-	@echo "   � 查看日志:  make logs        🛑 一键停止: make stop"
+	@echo "   🔧 后端接口:  http://127.0.0.1:$(BACKEND_PORT)   API 文档: http://127.0.0.1:$(BACKEND_PORT)/docs"
+	@echo "   📋 查看日志:  make logs        🛑 一键停止: make stop"
 	@echo ""
 
 dev: start                            ## 同 start（别名）
@@ -168,6 +228,30 @@ pg-wait:                              ## 轮询等待 PostgreSQL 就绪 (最多 
 	exit 1
 
 # =============================================================================
+#  生产部署 (Docker 全栈)
+# =============================================================================
+.PHONY: prod prod-up prod-down prod-logs prod-ps prod-reset
+
+PROD_COMPOSE := docker compose -f docker-compose.prod.yml
+
+prod: prod-up                        ## 生产全栈启动(构建镜像并后台运行, 对外端口 $(PROD_PORT))
+
+prod-up:                             ## 构建并后台启动生产全栈(Postgres + Redis + 后端 + 前端nginx)
+	$(PROD_COMPOSE) up -d --build
+
+prod-down:                           ## 停止生产全栈(保留数据卷)
+	$(PROD_COMPOSE) down
+
+prod-logs:                           ## 实时查看生产各服务日志 (Ctrl+C 退出)
+	$(PROD_COMPOSE) logs -f
+
+prod-ps:                             ## 查看生产各服务状态
+	$(PROD_COMPOSE) ps
+
+prod-reset:                          ## ⚠️ 停止生产全栈并清空生产数据卷
+	$(PROD_COMPOSE) down -v
+
+# =============================================================================
 #  数据库迁移 (Alembic)
 # =============================================================================
 .PHONY: db-generate db-upgrade db-downgrade db-history db-current db-reset
@@ -194,14 +278,21 @@ db-reset: infra-down infra-up                    ## ⚠️ 清空数据卷后重
 # =============================================================================
 #  后端 (Backend / uv)
 # =============================================================================
-.PHONY: backend-env backend-deps backend backend-lint backend-format backend-typecheck
+.PHONY: backend-env backend-deps backend backend-lint backend-format backend-typecheck backend-test check
 
-backend-env:                          ## 创建后端 .env (若不存在)
-	@if [ ! -f $(BACKEND_DIR)/.env ]; then \
-		cp $(BACKEND_DIR)/.env.example $(BACKEND_DIR)/.env; \
-		echo "✅ 已创建 backend/.env，请填入真实密钥 (至少 LLM_API_KEY)"; \
+backend-env:                          ## 检查根目录 .env（后端与 compose 共用同一份）
+	@if [ ! -f $(ROOT_ENV) ]; then \
+		if cp $(ROOT_ENV).example $(ROOT_ENV) 2>/dev/null; then \
+			echo "✅ 已从 .env.example 创建 .env，请填入真实密钥 (至少 LLM_API_KEY)"; \
+		else \
+			echo "❌ 创建 .env 失败：$(ROOT_ENV).example 不存在"; \
+			exit 1; \
+		fi; \
 	else \
-		echo "✅ backend/.env 已存在"; \
+		echo "✅ .env 已存在"; \
+	fi
+	@if ! grep -qE '^LLM_API_KEY=.+' $(ROOT_ENV); then \
+		echo "   ⚠️  .env 里的 LLM_API_KEY 为空，涉及模型的接口会调用失败"; \
 	fi
 
 backend-deps: backend-env             ## 安装后端依赖 (uv sync)
@@ -218,6 +309,12 @@ backend-format:                       ## 后端格式化 (ruff format)
 
 backend-typecheck:                    ## 后端类型检查 (mypy)
 	cd $(BACKEND_DIR) && $(UV) run mypy app
+
+backend-test:                         ## 后端单元测试 (pytest)
+	cd $(BACKEND_DIR) && $(UV) run pytest -q
+
+check: backend-lint backend-typecheck backend-test  ## 提交前自检: ruff + mypy + pytest
+	@echo "✅ 后端自检通过"
 
 # =============================================================================
 #  前端 (Frontend / pnpm)

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     )
 
     # ---- 应用基础 ----
-    APP_NAME: str = "RAG Demo"
+    APP_NAME: str = "Agent Orchestrator"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
     API_PREFIX: str = "/api/v1"

@@ -1,0 +1,94 @@
+# ===== 生产部署 compose =====
+# 用法(项目根目录):
+#   docker compose -f docker-compose.prod.yml up -d --build
+# 依赖根目录 .env 提供密钥与接入配置(LLM_API_KEY/JWT_SECRET_KEY/POSTGRES_* 等)。
+#
+# 与开发 docker-compose.yml 的区别:
+#   1. 用 Dockerfile 构建后端与前端镜像(而非宿主机跑代码)
+#   2. nginx 统一对外: 前端(nginx)暴露 ${PROD_PORT}, 后端与数据库不对外
+#   3. 迁移在后端容器 CMD 中"启动前自动执行"(alembic upgrade head)
+#   4. 生产仅 PostgreSQL / Redis / 后端 / 前端(nginx) 四服务
+
+name: agent-orchestrator-prod
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-rag_demo}
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    # 注意: 这里用 redis:6-alpine(非 Redis Stack),
+    # 因此后端 Checkpoint 保持默认 memory, 不启用 RedisSaver。
+    # 如需持久化 Agent 状态, 需换成 redis/redis-stack-server 并把
+    # AGENT_CHECKPOINT_BACKEND 设为 redis。
+    image: redis:6-alpine
+    volumes:
+      - redisdata_prod:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DEBUG: "false"
+      # 容器内通过服务名访问数据库/Redis(compose 内网, 端口为容器内端口)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-rag_demo}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      # LLM / Embedding 配置(密钥缺失时 :? 强制报错)
+      LLM_API_KEY: ${LLM_API_KEY:?请设置 LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-qwen-turbo}
+      # 注意: 生产 Embedding 不要指向 127.0.0.1(容器内是容器自身, 无法访问宿主机 Ollama),
+      # 请在 .env 里配为云端端点或可达的网络地址。
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      # 安全: 生产必须替换为随机长字符串
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?请设置 JWT_SECRET_KEY}
+    volumes:
+      # 上传的源文档持久化(后端落盘在 /app/data)
+      - data_prod:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${PROD_PORT:-80}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata_prod:
+  redisdata_prod:
+  data_prod:

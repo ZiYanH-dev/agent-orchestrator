@@ -79,6 +79,7 @@ class DocumentService:
         self._session.commit()
         self._session.refresh(document)
         cache.delete_prefix(user_retrieval_prefix(user_id))
+        
         return DocumentOut.model_validate(document)
 
     def list_documents(self, user_id: int, skip: int, limit: int) -> DocumentListOut:
@@ -104,6 +105,7 @@ class DocumentService:
         )
         if document is None:
             raise NotFoundError(message="文档不存在")
+        
         self._vector_repo.delete_embedding_by_document(document_id)
         self._chunk_repo.delete_by_document(document_id)
         self._document_repo.delete(document)

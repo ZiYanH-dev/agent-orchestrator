@@ -10,9 +10,9 @@
 留出位置：新增工具只要注册进工具表，由 supervisor 决定要不要调用。
 
 护栏：
-    模型决策不受约束，因此叠加五层保护 —— 步数上限、目标白名单校验、原地打转
-    检测、工具调用次数上限、重试次数上限。任一层触发都退回规则路径，
-    保证图无论模型输出什么都一定收敛。
+    模型决策不受约束，因此叠加六层保护 —— 步数上限、目标白名单校验、前置状态
+    校验、原地打转检测、工具调用次数上限、重试次数上限。任一层触发都退回规则
+    路径，保证图无论模型输出什么都一定收敛。
 """
 
 from __future__ import annotations
@@ -233,6 +233,26 @@ def _progress_key(state: AgentState) -> str:
     )
 
 
+def _prerequisites_met(target: str, state: AgentState) -> bool:
+    """判断目标节点的前置状态是否已具备。
+
+    模型可以直接点名任意工人节点，但每个节点本体都假设前置节点已经把共享状态
+    写好了：retriever 读 sub_tasks 与 current_task_index，generator 与 reviewer
+    读 context_docs，reviewer 还需要 draft_answer。跳过前置节点直接点名下游节点，
+    节点就会读到不存在的键而抛 KeyError，整轮运行以 failed 收尾。因此「前置状态
+    是否具备」必须与目标名一道纳入护栏，不满足时退回规则路径，而不是让节点崩掉。
+    """
+
+    if target == "retriever":
+        sub_tasks = state.get("sub_tasks", [])
+        return bool(sub_tasks) and state.get("current_task_index", 0) < len(sub_tasks)
+    if target == "generator":
+        return "context_docs" in state
+    if target == "reviewer":
+        return "draft_answer" in state
+    return True
+
+
 def rule_based_route(state: AgentState) -> str:
     """规则兜底路径，与确定性编排的边保持同样的顺序。
 
@@ -381,7 +401,13 @@ def build_dynamic_graph(
             target = rule_based_route(state)
             reason = "非法目标，回退规则路由"
 
-        # 护栏三：连续两次选同一目标且实质进展没变，判定为原地打转
+        # 护栏三：目标节点的前置状态必须已就绪，否则节点会读到缺失的状态键
+        if target != END and not _prerequisites_met(target, state):
+            logger.warning("supervisor 派发 %r 时前置状态未就绪，回退规则路由", target)
+            target = rule_based_route(state)
+            reason = "前置状态未就绪，回退规则路由"
+
+        # 护栏四：连续两次选同一目标且实质进展没变，判定为原地打转
         progress_key = _progress_key(state)
         if target == state.get("last_target") and progress_key == state.get(
             "last_progress_key"
@@ -390,14 +416,14 @@ def build_dynamic_graph(
             target = rule_based_route(state)
             reason = "重复选择且无进展，回退规则路由"
 
-        # 护栏四：工具调用次数封顶，避免模型反复调工具空刷步数
+        # 护栏五：工具调用次数封顶，避免模型反复调工具空刷步数
         tool_calls = len(state.get("tool_trace", []))
         if target == "tool" and tool_calls >= settings.AGENT_MAX_TOOL_CALLS:
             logger.warning("工具调用已达上限 %d 次，回退规则路由", tool_calls)
             target = rule_based_route(state)
             reason = "工具调用已达上限，回退规则路由"
 
-        # 护栏五：重试次数已满时不允许再回到 generator 重写
+        # 护栏六：重试次数已满时不允许再回到 generator 重写
         if target == "generator" and state.get("retry_count", 0) >= state.get(
             "max_retry", 3
         ):

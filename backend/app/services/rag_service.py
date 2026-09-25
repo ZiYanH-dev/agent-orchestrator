@@ -73,6 +73,7 @@ class RagService:
             )
             for row in rows
         ]
+        
         return {**state, "context": docs}
 
     def _generate(self, state: RagState) -> RagState:
@@ -100,11 +101,13 @@ class RagService:
         """构建 LangGraph 状态图。"""
 
         graph = StateGraph(RagState)
+
         graph.add_node("retrieve", self._retrieve)
         graph.add_node("generate", self._generate)
         graph.add_edge(START, "retrieve")
         graph.add_edge("retrieve", "generate")
         graph.add_edge("generate", END)
+
         return graph.compile()
 
     def chat(self, user_id: int, session_id: str, question: str) -> ChatResponse:
